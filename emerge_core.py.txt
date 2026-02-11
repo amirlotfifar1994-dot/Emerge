@@ -1,0 +1,338 @@
+"""E.M.E.R.G.E+ simulation code (theoretical + simulations)
+
+This package generates all figures and tables reported in the manuscript's
+"Computational Demonstrations" section.
+
+IMPORTANT:
+- Outputs are mathematical demonstrations with hypothetical parameters.
+- No empirical human-participant data are used or implied.
+- Randomness is controlled via a fixed seed to ensure exact reproducibility.
+
+Author: Amir Lotfifar (manuscript); code implementation in this repository.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Tuple
+import numpy as np
+
+
+def _clip01(x: np.ndarray) -> np.ndarray:
+    return np.clip(x, 0.0, 1.0)
+
+
+def _zscore_to_baseline(x: np.ndarray, baseline_mask: np.ndarray, sd_floor: float = 0.5) -> np.ndarray:
+    """Z-score x using mean/std computed on a baseline window.
+
+    A small-variance baseline can cause unrealistically large z-scores (and meaning saturation).
+    We therefore apply a conservative standard-deviation floor (default: 0.5 arb.u.).
+    """
+    base = x[baseline_mask]
+    mu = float(np.mean(base))
+    sd = float(np.std(base, ddof=0))
+    sd = max(sd, float(sd_floor))
+    return (x - mu) / sd
+
+
+
+def _first_order_delay(signal: np.ndarray, dt: float, tau: float) -> np.ndarray:
+    """Simple first-order low-pass filter used as a 'delay-like' operator.
+
+    This approximates a sluggish feedback term rather than a strict time shift.
+    For strict time shift you could use an index offset, but the low-pass is
+    numerically smoother for Euler integration.
+
+    y' = (signal - y) / tau
+    """
+    if tau <= 0:
+        return signal.copy()
+    y = np.zeros_like(signal, dtype=float)
+    a = dt / tau
+    for i in range(1, len(signal)):
+        y[i] = y[i-1] + a * (signal[i] - y[i-1])
+    return y
+
+
+
+@dataclass(frozen=True)
+class RoutineParams:
+    # Rates (arb.u./s)
+    alpha_E: float = 0.4
+    alpha_C: float = 0.3
+    beta_E: float = 0.3
+    beta_C: float = 0.3
+    chi_E: float = 0.2
+    chi_C: float = 0.2
+
+    # Meaning mapping (tanh-bounded then mapped to [0,1])
+    xi: float = 0.25
+    lambda_e: float = 0.3
+    lambda_c: float = 0.3
+    delta_psi: float = 0.25
+    meaning_bias: float = -0.8  # constant offset for visualization (dimensionless)
+
+    # Other
+    E_opt: float = 0.5
+    sigma: float = 0.1
+
+    # Feedback / memory time constants (s)
+    tau_phi: float = 0.25     # within 0.1–0.5 s
+    tau_theta: float = 0.40   # within 0.2–0.6 s
+
+    # Cultural adaptation
+    kappa_psi: float = 0.25   # 1/s (slow relative to dt=0.01)
+
+
+@dataclass(frozen=True)
+class RoutineConfig:
+    duration_s: float = 10.0
+    dt_s: float = 0.01
+    seed: int = 2025
+
+    # Stylized inputs (normalized to [0,1])
+    E_base: float = 0.60
+    C_base: float = 0.70
+    input_noise_sd: float = 0.03
+
+    # Cultural factor baseline + group norm
+    psi0: float = 0.50
+    S_group: float = 0.60
+
+    # Baseline window fraction for z-scoring
+    baseline_frac: float = 0.10
+
+
+def simulate_routine(params: RoutineParams, cfg: RoutineConfig) -> Dict[str, np.ndarray]:
+    """Simulate the routine-process equations over 0..duration_s.
+
+    Model (Euler, dt=cfg.dt_s):
+        dH_e/dt = -alpha_E*tanh(E - E_opt) - beta_E*Phi - chi_E*Theta + noise
+        dH_c/dt = -alpha_C*C - beta_C*Phi - chi_C*Theta + noise
+        dPsi/dt = kappa_psi*(S_group - Psi)
+
+    Where:
+        - Phi is an 'awareness feedback' proxy, implemented as a low-pass
+          filtered version of (E - E_opt).
+        - Theta is a 'memory integration' proxy, implemented as a low-pass
+          filtered version of cumulative-mean(E).
+    """
+    rng = np.random.default_rng(cfg.seed)
+
+    t = np.arange(0.0, cfg.duration_s + cfg.dt_s, cfg.dt_s)
+    n = len(t)
+
+    # Stylized inputs (normalized to [0,1]) with mild structure + noise
+    # Keep these deterministic given the seed.
+    drift = 0.02 * np.sin(2.0 * np.pi * t / cfg.duration_s)  # gentle modulation
+    E = _clip01(cfg.E_base + drift + rng.normal(0.0, cfg.input_noise_sd, size=n))
+    C = _clip01(cfg.C_base - 0.5*drift + rng.normal(0.0, cfg.input_noise_sd, size=n))
+
+    # Construct Phi and Theta proxies
+    phi_raw = E - params.E_opt
+    Phi = _first_order_delay(phi_raw, cfg.dt_s, params.tau_phi)
+
+    # A 'memory' proxy: cumulative mean of E, then low-pass filtered
+    cum_mean_E = np.cumsum(E) / np.arange(1, n+1)
+    Theta = _first_order_delay(cum_mean_E - np.mean(cum_mean_E[:max(2, int(cfg.baseline_frac*n))]),
+                               cfg.dt_s, params.tau_theta)
+
+    # State variables
+    H_e = np.zeros(n, dtype=float)
+    H_c = np.zeros(n, dtype=float)
+    Psi = np.zeros(n, dtype=float)
+    Psi[0] = cfg.psi0
+
+    # Noise terms
+    noise_e = rng.normal(0.0, params.sigma, size=n)
+    noise_c = rng.normal(0.0, params.sigma, size=n)
+
+    for i in range(1, n):
+        # cultural adaptation
+        dpsi = params.kappa_psi * (cfg.S_group - Psi[i-1])
+        Psi[i] = Psi[i-1] + cfg.dt_s * dpsi
+
+        # entropies
+        dHe = (
+            -params.alpha_E * np.tanh(E[i-1] - params.E_opt)
+            -params.beta_E * Phi[i-1]
+            -params.chi_E * Theta[i-1]
+            + noise_e[i-1]
+        )
+        dHc = (
+            -params.alpha_C * C[i-1]
+            -params.beta_C * Phi[i-1]
+            -params.chi_C * Theta[i-1]
+            + noise_c[i-1]
+        )
+        H_e[i] = H_e[i-1] + cfg.dt_s * dHe
+        H_c[i] = H_c[i-1] + cfg.dt_s * dHc
+
+    # Meaning computation with baseline z-scoring
+    base_n = max(2, int(cfg.baseline_frac * n))
+    baseline_mask = np.zeros(n, dtype=bool)
+    baseline_mask[:base_n] = True
+
+    zHe = _zscore_to_baseline(H_e, baseline_mask, sd_floor=0.5)
+    zHc = _zscore_to_baseline(H_c, baseline_mask, sd_floor=0.5)
+
+    m_raw = (params.xi * E * C
+             - params.lambda_e * zHe
+             - params.lambda_c * zHc
+             + params.delta_psi * Psi
+             + params.meaning_bias)
+    m_tanh = np.tanh(m_raw)
+    M_r = 0.5 * (m_tanh + 1.0)  # map to [0,1]
+
+    return {
+        "t_s": t,
+        "E": E,
+        "C": C,
+        "Phi": Phi,
+        "Theta": Theta,
+        "Psi": Psi,
+        "H_e": H_e,
+        "H_c": H_c,
+        "zH_e": zHe,
+        "zH_c": zHc,
+        "M_r": M_r,
+        "m_raw": m_raw,
+    }
+
+
+
+@dataclass(frozen=True)
+class TransformativeParams:
+    # Shared
+    alpha_E: float = 0.4
+    E_opt: float = 0.5
+    sigma: float = 0.03  # lower noise in hour-scale sim for stability
+
+    # Perturbation & attractor
+    gamma: float = 0.8
+    beta_transform: float = 0.6
+    H_e_star: float = -0.5
+
+    # Meaning mapping (simplified; bounded then integrated)
+    xi: float = 0.30
+    lambda_e: float = 0.35
+    meaning_bias: float = -0.4  # constant offset for visualization
+
+    # Drug curve parameters (stylized gamma-like)
+    A: float = 1.2
+    t_max_h: float = 2.0
+    n_shape: float = 3.0
+
+    # Baseline window fraction for z-scoring
+    baseline_frac: float = 0.05
+
+
+@dataclass(frozen=True)
+class TransformativeConfig:
+    duration_h: float = 8.0
+    dt_h: float = 0.01  # hours (~36s)
+    seed: int = 2025
+
+    # Stylized inputs
+    E_base: float = 0.45
+    C_base: float = 0.75
+    e_gain: float = 0.35
+    c_drop: float = 0.35
+    input_noise_sd: float = 0.02
+
+
+def drug_profile_gamma_like(t_h: np.ndarray, A: float, t_max_h: float, n_shape: float) -> np.ndarray:
+    """Stylized gamma-shaped perturbation curve (not validated PK)."""
+    t = np.maximum(t_h, 1e-9)  # avoid 0^n
+    return A * (t / t_max_h) ** n_shape * np.exp(-n_shape * (t - t_max_h) / t_max_h)
+
+
+def simulate_transformative(params: TransformativeParams, cfg: TransformativeConfig) -> Dict[str, np.ndarray]:
+    """Simulate the transformative biphasic demonstration over 0..duration_h.
+
+    Phase 1 (t <= t_peak):
+        dH_e/dt = +gamma*D(t) - alpha_E*tanh(E - E_opt) + noise
+    Phase 2 (t > t_peak):
+        dH_e/dt = -alpha_E*tanh(E - E_opt) - beta_transform*(H_e - H_e_star) + noise
+
+    Meaning:
+        - Instantaneous meaning m_inst = tanh(xi*E*C - lambda_e*zH_e)
+        - Cumulative M_t = normalized time integral of m_inst mapped to [0,1]
+    """
+    rng = np.random.default_rng(cfg.seed)
+
+    t = np.arange(0.0, cfg.duration_h + cfg.dt_h, cfg.dt_h)
+    n = len(t)
+
+    D = drug_profile_gamma_like(t, params.A, params.t_max_h, params.n_shape)
+    t_peak = float(t[np.argmax(D)])
+
+    # Stylized E and C inputs with perturbation coupling
+    E = _clip01(cfg.E_base + cfg.e_gain * (D / np.max(D)) + rng.normal(0.0, cfg.input_noise_sd, size=n))
+    # Cognitive structure drops with perturbation, then slowly recovers
+    recovery = (t / cfg.duration_h)
+    C = _clip01(cfg.C_base - cfg.c_drop * (D / np.max(D)) + 0.10 * recovery
+                + rng.normal(0.0, cfg.input_noise_sd, size=n))
+
+    H_e = np.zeros(n, dtype=float)
+    noise_e = rng.normal(0.0, params.sigma, size=n)
+
+    for i in range(1, n):
+        if t[i-1] <= t_peak:
+            dHe = (
+                +params.gamma * D[i-1]
+                -params.alpha_E * np.tanh(E[i-1] - params.E_opt)
+                + noise_e[i-1]
+            )
+        else:
+            dHe = (
+                -params.alpha_E * np.tanh(E[i-1] - params.E_opt)
+                -params.beta_transform * (H_e[i-1] - params.H_e_star)
+                + noise_e[i-1]
+            )
+        H_e[i] = H_e[i-1] + cfg.dt_h * dHe
+
+    # Z-score H_e relative to early baseline window
+    base_n = max(2, int(params.baseline_frac * n))
+    baseline_mask = np.zeros(n, dtype=bool)
+    baseline_mask[:base_n] = True
+    zHe = _zscore_to_baseline(H_e, baseline_mask, sd_floor=0.5)
+
+    # Instantaneous meaning in [-1,1], then mapped to [0,1]
+    m_raw = params.xi * E * C - params.lambda_e * zHe + params.meaning_bias
+    m_inst = np.tanh(m_raw)
+    m_inst_01 = 0.5 * (m_inst + 1.0)
+
+    # Cumulative meaning: normalized integral (0..1)
+    Mt = np.cumsum(m_inst_01) * cfg.dt_h
+    Mt = Mt / float(Mt[-1])  # normalize so final is 1.0 (report relative trajectory)
+
+    return {
+        "t_h": t,
+        "D": D,
+        "t_peak_h": np.array([t_peak]),
+        "E": E,
+        "C": C,
+        "H_e": H_e,
+        "zH_e": zHe,
+        "m_raw": m_raw,
+        "m_inst_01": m_inst_01,
+        "M_t": Mt,
+    }
+
+
+def time_to_threshold(t: np.ndarray, y: np.ndarray, thr: float) -> float:
+    """Return first time where y >= thr, or NaN if never crossed."""
+    idx = np.where(y >= thr)[0]
+    if len(idx) == 0:
+        return float("nan")
+    return float(t[idx[0]])
+
+
+def sample_at_times(t: np.ndarray, y: np.ndarray, sample_times: np.ndarray) -> np.ndarray:
+    """Sample y at given times using nearest-neighbor indexing."""
+    out = []
+    for st in sample_times:
+        j = int(np.argmin(np.abs(t - st)))
+        out.append(float(y[j]))
+    return np.array(out, dtype=float)

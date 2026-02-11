@@ -1,0 +1,21 @@
+from pathlib import Path
+import os
+
+import emerge_simulation
+import emerge_transformative
+
+def main():
+    out = Path("outputs")
+    out.mkdir(parents=True, exist_ok=True)
+
+    cwd = Path.cwd()
+    try:
+        # data outputs
+        os.chdir(out)
+        emerge_simulation.main()
+        emerge_transformative.main()
+    finally:
+        os.chdir(cwd)
+
+if __name__ == "__main__":
+    main()
